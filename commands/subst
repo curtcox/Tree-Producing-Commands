@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""subst — extrinsic parameter substitution, "better than sed" (TPC-spec.md §8.3, §15.1).
+
+Why this exists
+    The tree has NO template-vs-behavior distinction (§8.3): parameterization is
+    extrinsic, done by an outside tool. Today that tool is `sed`; this is the
+    deferred-but-intended replacement (§15.1). The reusable unit stays a
+    path/command (§9), not a special "template" type.
+
+How it beats `sed`
+    1. LITERAL values. A value is substituted verbatim — no regex
+       metacharacters, no `&`/`\1` backreference surprises, no delimiter
+       collisions. `sed s/.../.../ ` reinterprets both sides; subst does not.
+    2. EXPLICIT placeholders. Only `{{NAME}}` is a placeholder; surrounding
+       text is never touched, so partial/accidental matches can't happen.
+    3. STRICT by default. An unset placeholder is an error (exit 65), not a
+       silently empty or skipped substitution. Opt out with --allow-missing.
+    4. ESCAPING modes. Values can be inserted raw, or escaped for a target
+       sink (--escape none|json|shell) so the substituted text is safe to drop
+       into a JSON string or a shell word.
+
+Invocation contract  [v0 proposal — §15.1 leaves the contract unspecified]
+    subst [options] [KEY=VALUE ...]
+      Reads the template from stdin (or --in FILE), writes the result to stdout
+      (or --out FILE). Parameters come from KEY=VALUE args and/or --params FILE
+      (line-oriented `KEY SP VALUE`, matching the `b` metadata grammar of §4.1).
+    options:
+      --in FILE          read template from FILE instead of stdin
+      --out FILE         write result to FILE instead of stdout
+      --params FILE      read additional KEY VALUE pairs (one per line)
+      --open / --close   placeholder delimiters (default `{{` / `}}`)
+      --escape MODE      none (default) | json | shell — applied to every value
+      --allow-missing    leave unknown placeholders untouched instead of erroring
+
+Exit
+    0 success; 64 usage; 65 unset placeholder (strict mode); 66 I/O error.
+"""
+
+import argparse
+import json
+import re
+import shlex
+import sys
+
+
+def load_params(pairs, params_file):
+    params = {}
+    if params_file:
+        try:
+            with open(params_file, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+                    key, _, value = line.partition(" ")
+                    params[key] = value
+        except OSError as exc:
+            sys.stderr.write(f"subst: cannot read --params: {exc}\n")
+            sys.exit(66)
+    for pair in pairs:
+        if "=" not in pair:
+            sys.stderr.write(f"subst: bad KEY=VALUE: {pair!r}\n")
+            sys.exit(64)
+        key, _, value = pair.partition("=")
+        params[key] = value
+    return params
+
+
+def escape(value, mode):
+    if mode == "none":
+        return value
+    if mode == "json":
+        return json.dumps(value)[1:-1]  # JSON string body, without the quotes
+    if mode == "shell":
+        return shlex.quote(value)
+    raise ValueError(mode)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--in", dest="infile")
+    ap.add_argument("--out", dest="outfile")
+    ap.add_argument("--params")
+    ap.add_argument("--open", default="{{")
+    ap.add_argument("--close", default="}}")
+    ap.add_argument("--escape", choices=["none", "json", "shell"], default="none")
+    ap.add_argument("--allow-missing", action="store_true")
+    ap.add_argument("pairs", nargs="*", metavar="KEY=VALUE")
+    args = ap.parse_args()
+
+    params = load_params(args.pairs, args.params)
+
+    try:
+        if args.infile:
+            with open(args.infile, "r", encoding="utf-8") as fh:
+                template = fh.read()
+        else:
+            template = sys.stdin.read()
+    except OSError as exc:
+        sys.stderr.write(f"subst: cannot read template: {exc}\n")
+        return 66
+
+    # A placeholder is {{ NAME }} with optional inner whitespace; NAME is a
+    # word (letters, digits, _, -, .). Nothing else is ever touched.
+    pattern = re.compile(
+        re.escape(args.open) + r"\s*([A-Za-z0-9_.-]+)\s*" + re.escape(args.close)
+    )
+    missing = []
+
+    def replace(match):
+        name = match.group(1)
+        if name in params:
+            return escape(params[name], args.escape)
+        missing.append(name)
+        return match.group(0) if args.allow_missing else ""
+
+    result = pattern.sub(replace, template)
+
+    if missing and not args.allow_missing:
+        uniq = ", ".join(sorted(set(missing)))
+        sys.stderr.write(f"subst: unset placeholder(s): {uniq}\n")
+        return 65
+
+    try:
+        if args.outfile:
+            with open(args.outfile, "w", encoding="utf-8") as fh:
+                fh.write(result)
+        else:
+            sys.stdout.write(result)
+    except OSError as exc:
+        sys.stderr.write(f"subst: cannot write result: {exc}\n")
+        return 66
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

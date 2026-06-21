@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""adapter — turn a TPC's stderr manifest into a PRG redirect (TPC-spec.md §3.3, §6, §7.4-7.6).
+
+Role
+    Generic adapter (§7.4 mode 2). Spawns a TPC, reads its `Created Node <path>`
+    stderr manifest, takes the LAST marker line as the redirect leaf, reads that
+    leaf's `a`/`b` back FROM DISK (the source of truth, §7.5), and synthesizes a
+    `303 See Other` to `/<leaf>/a` plus the cache headers of §6. The adapter
+    materializes nothing itself; the node-producer stays HTTP-ignorant (§3.3).
+
+    Modes 2/3 are PRG: the TPC's stdout is disregarded (§7.4); the response body
+    on the follow-up GET is the on-disk `a`, not stdout.
+
+Invocation contract  [ASSUMPTION — align with runtime.md §12.5 once available]
+    argv:  adapter --tree-root DIR [--view-prefix PREFIX] -- <tpc> [tpc args...]
+      --tree-root    on-disk tree root; manifest paths resolve under it.
+      --view-prefix  URL prefix for the redirect Location (default "/").
+                     e.g. "/tree-view" → Location: /tree-view/0/0/0/a.
+      everything after `--` is the TPC command line, spawned as a subprocess.
+    stdin: forwarded to the TPC (the POST body).
+    stdout: a full HTTP/1.1 response (wash §12.5 lets a command emit one).
+
+Output (success)
+    303 See Other
+    Location: <view-prefix>/<leaf>/a
+    Cache-Control: <from leaf b.freshness, default no-cache>   (§6.1)
+    ETag: "<sha256 hex of leaf a, text only>"                  (§6.2)
+    Last-Modified: <b.created if present else fs mtime, HTTP-date>  (§6.2)
+
+Output (TPC nonzero exit, §10.1)
+    An error response with NO redirect; partial writes remain on disk. The
+    exact status is an open point (§10.1 OPEN); we default to 400 (wash's
+    nonzero-exit default) and allow override via --error-status.
+
+Resolved-here OPENs (documented, easy to change):
+    §6.1  freshness key = `freshness`, values `immutable` | `no-cache`.
+    §6.2  ETag = strong, sha256 of `a` bytes, lowercase hex.
+"""
+
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+from email.utils import formatdate, parsedate_to_datetime
+
+MARKER_PREFIX = "Created Node "
+FRESHNESS_KEY = "freshness"
+DEFAULT_CACHE_CONTROL = "no-cache"  # §6.1 default
+VALID_CACHE_CONTROL = {"no-cache", "immutable"}
+
+
+def parse_metadata(path):
+    """Parse a node's line-oriented `b` file: `key SP value` (§4.1)."""
+    meta = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                key, _, value = line.partition(" ")
+                meta[key] = value
+    except FileNotFoundError:
+        pass  # a node with only `a` and no `b` is conformant (§4.1)
+    return meta
+
+
+def url_to_disk(url_path):
+    """Translate a URL ordinal path to its on-disk path: letter-bearing
+    segments are `_`-prefixed on disk, bare in URLs (sdt-spec §3.7, §6.4)."""
+    out = []
+    for seg in url_path.strip("/").split("/"):
+        if not seg:
+            continue
+        out.append("_" + seg if any(c.isalpha() for c in seg) else seg)
+    return os.path.join(*out) if out else ""
+
+
+def http_response(status, headers, body=b""):
+    """Serialize a full HTTP/1.1 response to bytes (§12.5)."""
+    lines = [f"HTTP/1.1 {status}"]
+    lines += [f"{k}: {v}" for k, v in headers]
+    head = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")
+    return head + body
+
+
+def compute_etag(a_path):
+    """ETag = sha256 of the node's `a` file ONLY, not `b` (§6.2)."""
+    h = hashlib.sha256()
+    with open(a_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return f'"{h.hexdigest()}"'  # strong ETag
+
+
+def last_modified(meta, node_disk):
+    """`b`.created if present (parsed as a date), else fs mtime (§6.2)."""
+    created = meta.get("created")
+    if created:
+        try:
+            # accept RFC 3339 / ISO-8601 UTC ("…Z") or an HTTP-date
+            from datetime import datetime, timezone
+
+            iso = created.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso)
+            return formatdate(dt.timestamp(), usegmt=True)
+        except ValueError:
+            try:
+                return formatdate(parsedate_to_datetime(created).timestamp(), usegmt=True)
+            except (TypeError, ValueError):
+                pass  # unparseable → fall through to mtime (advisory only)
+    return formatdate(os.path.getmtime(node_disk), usegmt=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--tree-root", required=True)
+    ap.add_argument("--view-prefix", default="/")
+    ap.add_argument("--error-status", default="400 Bad Request")
+    ap.add_argument("tpc", nargs=argparse.REMAINDER,
+                    help="TPC command line, after `--`")
+    args = ap.parse_args()
+
+    tpc_argv = args.tpc[1:] if args.tpc and args.tpc[0] == "--" else args.tpc
+    if not tpc_argv:
+        sys.stderr.write("adapter: no TPC command given (expected `-- <tpc> ...`)\n")
+        return 64
+
+    # Spawn the TPC. Forward our stdin (the POST body); capture stderr (the
+    # manifest); DISREGARD stdout (PRG, §7.4) — drain it so the TPC never blocks.
+    proc = subprocess.run(
+        tpc_argv,
+        stdin=sys.stdin.buffer,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    stderr_text = proc.stderr.decode("utf-8", errors="replace")
+
+    if proc.returncode != 0:
+        # §10.1: error, no redirect, partial writes remain on disk.
+        body = (f"TPC failed (exit {proc.returncode}).\n\n{stderr_text}").encode("utf-8")
+        sys.stdout.buffer.write(http_response(
+            args.error_status,
+            [("Content-Type", "text/plain; charset=utf-8"),
+             ("Content-Length", str(len(body)))],
+            body,
+        ))
+        return 0  # adapter itself succeeded at producing an HTTP response
+
+    # Parse the manifest; the LAST `Created Node` line names the leaf (§7.3).
+    leaf_url = None
+    for line in stderr_text.splitlines():
+        if line.startswith(MARKER_PREFIX):
+            leaf_url = line[len(MARKER_PREFIX):].strip()
+    if leaf_url is None:
+        body = b"TPC produced no `Created Node` manifest lines.\n"
+        sys.stdout.buffer.write(http_response(
+            "500 Internal Server Error",
+            [("Content-Type", "text/plain; charset=utf-8"),
+             ("Content-Length", str(len(body)))],
+            body,
+        ))
+        return 0
+
+    node_disk = os.path.join(args.tree_root, url_to_disk(leaf_url))
+    a_path = os.path.join(node_disk, "a")
+    meta = parse_metadata(os.path.join(node_disk, "b"))
+
+    # Cache-Control from leaf freshness, default no-cache (§6.1).
+    freshness = meta.get(FRESHNESS_KEY, DEFAULT_CACHE_CONTROL)
+    if freshness not in VALID_CACHE_CONTROL:
+        freshness = DEFAULT_CACHE_CONTROL
+
+    location = args.view_prefix.rstrip("/") + "/" + leaf_url.strip("/") + "/a"
+
+    headers = [
+        ("Location", location),
+        ("Cache-Control", freshness),
+        ("ETag", compute_etag(a_path)),
+        ("Last-Modified", last_modified(meta, node_disk)),
+        ("Content-Length", "0"),
+    ]
+    sys.stdout.buffer.write(http_response("303 See Other", headers))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
