@@ -1,0 +1,8 @@
+# wash command metadata for `subst` (pipeline_parsing.md §5; runtime.md §7.3)
+# A pure substitution function: no mutation, GET-able.
+arity *
+input stdin
+output stdout
+methods GET POST
+mutates false
+stderr discard

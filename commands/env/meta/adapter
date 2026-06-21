@@ -1,0 +1,8 @@
+# wash command metadata for `adapter` (pipeline_parsing.md §5; runtime.md §7.3)
+# Emits a full HTTP response (303 + cache headers) on stdout; mutates via the TPC.
+arity *
+input stdin
+output stdout
+methods POST
+mutates true
+stderr discard

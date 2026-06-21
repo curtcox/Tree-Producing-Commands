@@ -9,54 +9,56 @@
 #   (§7.3). This command is HTTP-ignorant (§3.3) — the adapter turns the
 #   stderr manifest into a 303.
 #
-# Method discipline (§3.6)
-#   This is a mutating command: POST-only, `mutates true`. wash enforces the
-#   method; this script assumes it is only ever invoked for a POST. It MUST
-#   NOT be composed with stderr-merge or `/&` (§3.2), since that would corrupt
-#   the manifest channel.
+# Method discipline (§3.6, runtime §9.5/§13.2)
+#   Mutating command: POST-only, `mutates true`. Declared in env/meta/tpc.
+#   MUST NOT be composed with stderr-merge or `/&` (§3.2 / runtime §8.8,
+#   §15.4) — its metadata sets `stderr discard`, never `merge`.
 #
-# Invocation contract  [ASSUMPTION — align with runtime.md once available]
-#   argv:  tpc <tree-root> <branch-path>
-#     <tree-root>   absolute path to the on-disk tree root directory.
-#     <branch-path> SDT path of the branch point, relative to <tree-root>,
-#                   using URL ordinals ("0/0", "0/1/A", or "" for the root).
-#                   A trailing "/a" selects EXISTING-NODE-POST (§7.1): the
-#                   addressed node is the branch point directly and no user
-#                   node is written.
-#   stdin: the POST body (the new user node's text, for body-POST).
+# Invocation contract  [confirmed against runtime.md §10.2/§10.6/§12.3/§12.4
+#                       and pipeline_parsing.md §5]
+#   cwd:   the configured tree root (runtime §12.3). Overridable with --root
+#          DIR or $WASH_ROOT for testing.
+#   argv:  the URL path suffix as positional segments (arity *, runtime §12.4).
+#          They are joined with "/" into the branch-point path, e.g.
+#          POST /tpc/0/1/A  ->  argv: 0 1 A  ->  branch "0/1/A".
+#          A trailing "a" segment selects EXISTING-NODE-POST (§7.1): the
+#          addressed node is the branch point directly; no user node is written.
+#          An empty suffix means the tree root is the branch point.
+#   stdin: the POST body (the new user node's text, for body-POST; input stdin).
 #   env:
-#     TPC_CMD   the content-producing command (§9: "the LLM is not special").
-#               Receives the branch-point text on stdin, prints the response
-#               text on stdout. Defaults to `cat` (an echo TPC) so the
-#               skeleton is runnable out of the box. Replace with a model
-#               call, `wc`, an Eliza script, etc.
-#     TPC_FRESHNESS  freshness to stamp into the response node's `b`
-#               (§6.1). Default: unset → adapter applies `no-cache` default.
-#     TPC_AUTHOR     author to stamp into the response node's `b` (§5.1).
-#               Default: "command".
+#     WASH_ROOT  tree root when cwd is not it (default: cwd).
+#     TPC_CMD    the content-producing command (§9: "the LLM is not special").
+#                Reads the branch-point text on stdin, prints the response text
+#                on stdout. Default `cat` (an echo TPC); swap for a model call,
+#                `wc`, an Eliza script, etc.
+#     TPC_FRESHNESS  freshness stamped into the response node `b` (§6.1).
+#                Default unset → adapter applies the `no-cache` default.
+#     TPC_AUTHOR     author stamped into the response node `b` (§5.1).
+#                Default "command".
 #
 # Exit
-#   0 on success. Nonzero (and partial writes left on disk, §10.1/§10.2) on
+#   0 on success. Nonzero (with partial writes left on disk, §10.1/§10.2) on
 #   failure; the adapter surfaces the error and withholds the 303.
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# SDT ordinal helpers  [ASSUMPTION — confirm against sdt-spec.md §3.7, §6.4]
+# SDT ordinal helpers  [confirmed against sdt-spec.md §3.2, §3.3, §3.7, §6.4]
 #
-# Child directories are named by base-36 ordinals (0..9, A..Z, then 10, 11, …).
-# A name containing a letter is stored `_`-prefixed on disk but bare in URLs.
-# "Dense" (§7.1, §10.4) means the next sibling index == current child count.
-# These two functions are the single point to change if the exact SDT ordinal
-# rule (e.g. true bijective base-36) differs.
+# Covered child directories use BIJECTIVE base-36 over 0..9 then A..Z, 1-based:
+#   1:0 2:1 … 10:9 11:A … 36:Z 37:00 38:01 … (encode via divmod(n-1, 36)).
+# A name containing any letter A..Z is stored `_`-prefixed on disk but bare in
+# URLs. "Dense" (§3.2 G6, §7.1) means present covered names form the prefix
+# 1..N, so the next dense sibling is ordinal N+1. These helpers are the single
+# place to change if the SDT ordinal rule ever moves.
 # ---------------------------------------------------------------------------
 
-ordinal_name() { # <index> -> URL ordinal (bare)
-  local n=$1 digits='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ' s=''
-  if [ "$n" -eq 0 ]; then printf '0'; return; fi
+ordinal_name() { # <n, 1-based> -> URL ordinal (bijective base-36)
+  local n=$1 digits='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ' s='' r
   while [ "$n" -gt 0 ]; do
-    s="${digits:$((n % 36)):1}$s"
-    n=$((n / 36))
+    r=$(( (n - 1) % 36 ))
+    s="${digits:$r:1}$s"
+    n=$(( (n - 1) / 36 ))
   done
   printf '%s' "$s"
 }
@@ -68,20 +70,20 @@ disk_name() { # <url ordinal> -> on-disk directory name
   esac
 }
 
-count_children() { # <dir> -> number of covered child node directories
+count_children() { # <dir> -> number of child node directories (dense → next-1)
   local dir=$1 c n=0
   [ -d "$dir" ] || { printf '0'; return; }
-  for c in "$dir"/*/ "$dir"/_*/; do
-    [ -d "$c" ] || continue          # globs that matched nothing expand literally
+  for c in "$dir"/*/; do             # `*` already matches `_`-prefixed names
+    [ -d "$c" ] || continue          # a glob that matched nothing stays literal
     n=$((n + 1))
   done
   printf '%s' "$n"
 }
 
-# url_to_disk: translate a URL ordinal path ("0/A/2") into its on-disk path
-# segment by segment (each letter-bearing segment gains the `_` prefix).
+# url_to_disk: translate a URL ordinal path ("0/A/2") to its on-disk path,
+# `_`-prefixing each letter-bearing segment (sdt-spec §3.7, §6.4).
 url_to_disk() { # <url path>
-  local p=$1 seg out=''
+  local p=$1 seg out='' segs
   IFS='/' read -ra segs <<<"$p"
   for seg in "${segs[@]}"; do
     [ -n "$seg" ] || continue
@@ -91,30 +93,36 @@ url_to_disk() { # <url path>
 }
 
 # ---------------------------------------------------------------------------
-# Argument handling
+# Argument handling: root from --root/$WASH_ROOT/cwd; branch path = joined argv
 # ---------------------------------------------------------------------------
 
-if [ "$#" -lt 1 ]; then
-  echo "usage: tpc <tree-root> [<branch-path>]" >&2
-  exit 64
+TREE_ROOT=${WASH_ROOT:-}
+if [ "${1:-}" = "--root" ]; then
+  TREE_ROOT=$2; shift 2
 fi
+TREE_ROOT=${TREE_ROOT:-$PWD}
 
-TREE_ROOT=$1
-BRANCH_URL=${2:-}
 TPC_CMD=${TPC_CMD:-cat}
 TPC_AUTHOR=${TPC_AUTHOR:-command}
 
 [ -d "$TREE_ROOT" ] || { echo "tpc: tree root not found: $TREE_ROOT" >&2; exit 66; }
 
-# Detect EXISTING-NODE-POST: a trailing "/a" (or bare "a") on the branch path
-# means the addressed node IS the branch point; no user node is written (§7.1).
+# Join remaining argv segments into the branch-point URL path.
+BRANCH_URL=""
+for seg in "$@"; do
+  [ -n "$seg" ] || continue
+  BRANCH_URL="${BRANCH_URL:+$BRANCH_URL/}$seg"
+done
+
+# Detect EXISTING-NODE-POST: a trailing "a" segment means the addressed node
+# IS the branch point; no user node is written (§7.1).
 EXISTING_NODE=0
 case "$BRANCH_URL" in
   a|*/a) EXISTING_NODE=1; BRANCH_URL=${BRANCH_URL%a}; BRANCH_URL=${BRANCH_URL%/} ;;
 esac
 
-# created_node: write a node directory with text (and optional metadata),
-# echo its URL path, and emit the stderr manifest marker.
+# created_node: write a node directory with text (and optional metadata), echo
+# its URL path, and emit the stderr manifest marker.
 created_node() { # <url path> <text-file> [<b-contents>]
   local url=$1 text_file=$2 meta=${3:-}
   local disk="$TREE_ROOT/$(url_to_disk "$url")"
@@ -123,8 +131,8 @@ created_node() { # <url path> <text-file> [<b-contents>]
   if [ -n "$meta" ]; then
     printf '%s\n' "$meta" >"$disk/b"
   fi
-  echo "Created Node $url" >&2      # the manifest channel (§3.2)
-  printf '%s' "$url"                 # returned to caller for chaining
+  echo "Created Node $url" >&2       # the manifest channel (§3.2)
+  printf '%s' "$url"                  # returned to caller for chaining
 }
 
 # ---------------------------------------------------------------------------
@@ -138,34 +146,32 @@ branch_disk="$TREE_ROOT/$(url_to_disk "$BRANCH_URL")"
 [ -d "$branch_disk" ] || { echo "tpc: branch point not found: $BRANCH_URL" >&2; exit 66; }
 
 if [ "$EXISTING_NODE" -eq 1 ]; then
-  # Existing-node-POST: reuse the addressed node as the branch point (§7.1).
+  # Existing-node-POST: reuse the addressed node as branch point (§7.1).
   input_url="$BRANCH_URL"
   input_disk="$branch_disk"
 else
-  # Body-POST: the request body becomes a new user node, the next dense
-  # sibling under the URL-targeted node (§7.1).
+  # Body-POST: the request body becomes a new user node, the next dense sibling
+  # under the URL-targeted node (§7.1). Next dense ordinal = count + 1 (1-based).
   cat >"$tmp/body"
-  idx=$(count_children "$branch_disk")
-  child=$(ordinal_name "$idx")
+  child=$(ordinal_name "$(( $(count_children "$branch_disk") + 1 ))")
   input_url="${BRANCH_URL:+$BRANCH_URL/}$child"
   created_node "$input_url" "$tmp/body" "author user" >/dev/null
   input_disk="$TREE_ROOT/$(url_to_disk "$input_url")"
 fi
 
 # Run the content-producing command over the branch-point text (§9). One POST
-# normally writes the response as a single child node, but a TPC may write
-# zero or many (§7.2) — extend here to materialize a deeper response subtree.
+# normally writes the response as a single child node, but a TPC may write zero
+# or many (§7.2) — extend here to materialize a deeper response subtree.
 "$TPC_CMD" <"$input_disk/a" >"$tmp/response" || {
   echo "tpc: content command failed: $TPC_CMD" >&2
   exit 70                            # partial writes remain on disk (§10.1)
 }
 
-ridx=$(count_children "$input_disk")
-rchild=$(ordinal_name "$ridx")
-resp_url="$input_url/$rchild"
+resp_child=$(ordinal_name "$(( $(count_children "$input_disk") + 1 ))")
+resp_url="$input_url/$resp_child"
 
-# Build the response node's `b` metadata (§6.1, §6.2): author, created, and
-# (optionally) freshness. created uses RFC 3339 / ISO-8601 UTC.
+# Build the response node `b` (§6.1, §6.2): author, created (RFC 3339 UTC),
+# and optional freshness.
 resp_meta="author $TPC_AUTHOR"$'\n'"created $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if [ -n "${TPC_FRESHNESS:-}" ]; then
   resp_meta="$resp_meta"$'\n'"freshness $TPC_FRESHNESS"

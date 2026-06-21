@@ -11,14 +11,22 @@ Role
     Modes 2/3 are PRG: the TPC's stdout is disregarded (§7.4); the response body
     on the follow-up GET is the on-disk `a`, not stdout.
 
-Invocation contract  [ASSUMPTION — align with runtime.md §12.5 once available]
-    argv:  adapter --tree-root DIR [--view-prefix PREFIX] -- <tpc> [tpc args...]
-      --tree-root    on-disk tree root; manifest paths resolve under it.
+Invocation contract  [confirmed against runtime.md §12.3/§12.5 and §5]
+    cwd:   the configured tree root (runtime §12.3); manifest paths resolve
+           under it. Override with --tree-root DIR or $WASH_ROOT.
+    argv:  adapter [--view-prefix P] [--tree-root D] -- <tpc> [tpc args...]
+           or, when no `--` is given, the positional args are the URL suffix
+           and are forwarded to the TPC named by $TPC.
       --view-prefix  URL prefix for the redirect Location (default "/").
                      e.g. "/tree-view" → Location: /tree-view/0/0/0/a.
-      everything after `--` is the TPC command line, spawned as a subprocess.
-    stdin: forwarded to the TPC (the POST body).
-    stdout: a full HTTP/1.1 response (wash §12.5 lets a command emit one).
+    env:
+      WASH_ROOT  tree root when cwd is not it (default: cwd).
+      TPC        TPC command to spawn when no `-- <tpc>` is given (default "tpc").
+      VIEW_PREFIX  default for --view-prefix.
+    stdin: forwarded to the TPC (the POST body; input stdin).
+    stdout: a full HTTP/1.1 response (runtime §12.5 lets a command emit one).
+            Declared `output stdout`, `mutates true`, `methods POST` in
+            env/meta/adapter.
 
 Output (success)
     303 See Other
@@ -73,7 +81,8 @@ def url_to_disk(url_path):
     for seg in url_path.strip("/").split("/"):
         if not seg:
             continue
-        out.append("_" + seg if any(c.isalpha() for c in seg) else seg)
+        # `_`-prefix iff the index contains any letter A..Z (sdt-spec §3.7).
+        out.append("_" + seg if any("A" <= c <= "Z" for c in seg) else seg)
     return os.path.join(*out) if out else ""
 
 
@@ -114,17 +123,31 @@ def last_modified(meta, node_disk):
 
 
 def main():
-    ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("--tree-root", required=True)
-    ap.add_argument("--view-prefix", default="/")
-    ap.add_argument("--error-status", default="400 Bad Request")
-    ap.add_argument("tpc", nargs=argparse.REMAINDER,
-                    help="TPC command line, after `--`")
-    args = ap.parse_args()
+    # Split argv on the first `--`: options before it, the TPC command line
+    # after it. With no `--`, the positional args are the URL suffix forwarded
+    # to $TPC (the wash-native shape: cwd = root, argv = path suffix).
+    argv = sys.argv[1:]
+    if "--" in argv:
+        split = argv.index("--")
+        opt_argv, tpc_argv = argv[:split], argv[split + 1:]
+    else:
+        opt_argv, tpc_argv = [], None
 
-    tpc_argv = args.tpc[1:] if args.tpc and args.tpc[0] == "--" else args.tpc
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--tree-root",
+                    default=os.environ.get("WASH_ROOT", os.getcwd()))
+    ap.add_argument("--view-prefix",
+                    default=os.environ.get("VIEW_PREFIX", "/"))
+    ap.add_argument("--error-status", default="400 Bad Request")
+    if tpc_argv is None:
+        ap.add_argument("suffix", nargs="*", help="URL suffix forwarded to $TPC")
+        args = ap.parse_args(argv)
+        tpc_argv = [os.environ.get("TPC", "tpc"), *args.suffix]
+    else:
+        args = ap.parse_args(opt_argv)
+
     if not tpc_argv:
-        sys.stderr.write("adapter: no TPC command given (expected `-- <tpc> ...`)\n")
+        sys.stderr.write("adapter: no TPC command (use `-- <tpc> ...` or set $TPC)\n")
         return 64
 
     # Spawn the TPC. Forward our stdin (the POST body); capture stderr (the

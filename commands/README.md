@@ -11,29 +11,41 @@ per file, best-fit language per component (spec-faithful "ordinary tools"):
 
 No third-party dependencies; no compiled toolchain.
 
+`env/meta/{tpc,adapter,subst}` are the wash command-metadata files
+(pipeline_parsing.md §5; runtime.md §7.3). Copy them under the served tree
+root's `env/meta/` directory.
+
 ## Quick end-to-end (matches §11.1)
 
 ```sh
 mkdir -p root/0 && printf 'Hello.' > root/0/a
 
-# body-POST through the adapter, with `rev` standing in as "the command" (§9)
-printf 'What is 2+2?' | TPC_CMD=rev \
-  ./adapter --tree-root ./root --view-prefix /tree-view -- ./tpc ./root 0
+# wash-native shape: cwd = tree root, branch path as argv, TPC from $TPC,
+# with `rev` standing in as "the command" (§9)
+( cd root && printf 'What is 2+2?' | TPC=../tpc TPC_CMD=rev \
+    ../adapter --view-prefix /tree-view 0 )
 # → 303 See Other, Location: /tree-view/0/0/0/a, Cache-Control: no-cache, ETag, Last-Modified
+
+# explicit/testing shape also works:
+printf 'What is 2+2?' | TPC_CMD=rev \
+  ./adapter --tree-root ./root --view-prefix /tree-view -- ./tpc --root ./root 0
 ```
 
-## Assumptions to reconcile with the base specs
+## Contracts (confirmed against the base specs)
 
-`runtime.md` and `sdt-spec.md` are referenced by the spec but not present in
-this repo. Where their contract is needed, these scaffolds make an explicit,
-centralized assumption (so it is one edit to align):
-
-- **Command invocation** (`tpc`/`adapter` headers): path via argv, POST body on
-  stdin, full HTTP response on stdout (wash §12.5). Confirm against `runtime.md`.
-- **SDT ordinals** (`tpc`: `ordinal_name`/`disk_name`; `adapter`: `url_to_disk`):
-  base-36 names `0..9,A..Z,10,…`; letter-bearing names `_`-prefixed on disk,
-  bare in URLs; "dense" next index == child count. Confirm against `sdt-spec.md`
-  §3.7/§6.4 (esp. whether ordinals are *truly* bijective base-36).
+- **Command invocation** (runtime §10.2/§10.6/§12.3/§12.4, pipeline_parsing §5):
+  cwd = configured tree root; URL suffix → positional argv (`arity *`); POST
+  body → stdin (`input stdin`); a command may emit a full HTTP response on
+  stdout (§12.5). Root overridable via `--root`/`--tree-root`/`$WASH_ROOT`.
+- **SDT ordinals** (sdt-spec §3.2/§3.3/§3.7/§6.4): covered child dirs use
+  **bijective** base-36 over `0..9A..Z` (1-based: `0,1,…,9,A,…,Z,00,01,…`,
+  `divmod(n-1,36)`); next dense sibling = ordinal `child_count + 1`; a name
+  containing any `A..Z` is stored `_`-prefixed on disk, bare in URLs.
+  Centralized in `tpc`:`ordinal_name`/`disk_name`/`url_to_disk` and
+  `adapter`:`url_to_disk`.
+- **Metadata** (pipeline_parsing §5): line-oriented `field value`. `tpc` and
+  `adapter` are `methods POST` / `mutates true` / `stderr discard` (never
+  `merge`, per §3.2); `subst` is `mutates false`, GET-able.
 
 ## Spec OPENs resolved here (all easy to change)
 
