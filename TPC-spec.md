@@ -2,7 +2,7 @@
 
 **Status:** Draft
 **Date:** 2026-06-19
-**Extends:** `runtime.md` (the wash runtime spec) and `sdt-spec.md` (the Sequential Directory Tree format, v1.1).
+**Extends:** [runtime.md](https://github.com/curtcox/wash/blob/main/specs/runtime.md) (the wash runtime spec) and [sdt-spec.md](https://github.com/curtcox/Sequential-Directory-Tree/blob/main/sdt-spec.md) (the Sequential Directory Tree format, v1.1).
 
 > This spec is normative only where it cites a DECISION from the source log. Where the log underdetermines a point, the text carries an explicit `> OPEN:` callout instead of a guess. Base-spec changes are stated as deltas in §3 and never assumed silently.
 
